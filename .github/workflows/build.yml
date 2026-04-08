@@ -1,0 +1,221 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'build-versions.env'
+      - '.github/workflows/build.yml'
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      GO_BOOTSTRAP_DIR: /opt/go-bootstrap
+      GO_INSTALL_DIR: /opt/go
+      BUILD_ROOT: /tmp/build
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load build versions from repo file
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f build-versions.env
+          set -a
+          source build-versions.env
+          set +a
+
+          echo "NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
+          echo "GO_VERSION=$GO_VERSION" >> "$GITHUB_ENV"
+          echo "SING_BOX_TAG=$SING_BOX_TAG" >> "$GITHUB_ENV"
+          echo "WIREGUARD_GO_TAG=$WIREGUARD_GO_TAG" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            wget \
+            curl \
+            unzip \
+            build-essential \
+            openjdk-25-jdk-headless \
+            patch
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "platform-tools"
+
+      - name: Export Android/Go paths
+        shell: bash
+        run: |
+          {
+            echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}"
+            echo "GOROOT=${GO_INSTALL_DIR}"
+            echo "GOPATH=${HOME}/go"
+            echo "PATH=${GO_INSTALL_DIR}/bin:${HOME}/go/bin:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:$PATH"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Go bootstrap toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "${GO_BOOTSTRAP_DIR}"
+          sudo chown -R "$USER:$USER" "${GO_BOOTSTRAP_DIR}"
+
+          wget -O /tmp/go-bootstrap.tar.gz -q "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+          tar -C "${GO_BOOTSTRAP_DIR}" --strip-components=1 -xf /tmp/go-bootstrap.tar.gz
+
+      - name: Download Go source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf "${GO_INSTALL_DIR}"
+          cd /opt
+          sudo wget -q "https://go.dev/dl/go${GO_VERSION}.src.tar.gz"
+          sudo tar -xf "go${GO_VERSION}.src.tar.gz"
+          sudo rm -f "go${GO_VERSION}.src.tar.gz"
+          sudo chown -R "$USER:$USER" "${GO_INSTALL_DIR}"
+
+      - name: Apply WireGuard Go runtime patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GO_INSTALL_DIR}"
+          wget -O - -q "https://git.zx2c4.com/wireguard-android/plain/tunnel/tools/libwg-go/goruntime-boottime-over-monotonic.diff" | patch -p1
+
+      - name: Compile Go from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GO_INSTALL_DIR}/src"
+          GOROOT_BOOTSTRAP="${GO_BOOTSTRAP_DIR}" ./make.bash
+
+      - name: Clone and patch wireguard-go
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${BUILD_ROOT}/wireguard-go"
+          cd "${BUILD_ROOT}/wireguard-go"
+          git clone https://github.com/SagerNet/wireguard-go.git .
+          git checkout "${WIREGUARD_GO_TAG}"
+          sed -i '/pauseManager.WaitActive()/d' device/timers.go
+
+      - name: Clone and patch sing-box
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${BUILD_ROOT}/sing-box"
+          cd "${BUILD_ROOT}/sing-box"
+          git clone --recurse-submodules https://github.com/SagerNet/sing-box.git .
+          git checkout "${SING_BOX_TAG}"
+          git submodule update --init --recursive
+          sed -i -e '/e.device.Down()/d' -e '/e.device.Up()/d' transport/wireguard/endpoint.go
+          go mod edit -replace github.com/sagernet/wireguard-go=../wireguard-go
+
+      - name: Decode keystore
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          echo "$KEYSTORE_B64" | base64 --decode > "${BUILD_ROOT}/sing-box/clients/android/app/release.keystore"
+
+      - name: Patch Android signing config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${BUILD_ROOT}/sing-box/clients/android"
+          sed -i 's/getProps("KEYSTORE_PASS")/System.getenv("KEYSTORE_PASS")/g' app/build.gradle.kts
+          sed -i 's/getProps("ALIAS_NAME")/System.getenv("ALIAS_NAME")/g' app/build.gradle.kts
+          sed -i 's/getProps("ALIAS_PASS")/System.getenv("ALIAS_PASS")/g' app/build.gradle.kts
+
+      - name: Build libbox AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${BUILD_ROOT}/sing-box"
+          sed -i -e '/java version should be openjdk 17/d' cmd/internal/build_libbox/main.go
+          make lib_install
+          ANDROID_TARGET=android/arm64 make lib_android
+          mkdir -p clients/android/app/libs
+          mv libbox.aar clients/android/app/libs/
+
+      - name: Build Android APK
+        shell: bash
+        env:
+          KEYSTORE_PASS: ${{ secrets.STORE_PASSWORD }}
+          ALIAS_NAME: ${{ secrets.KEY_ALIAS }}
+          ALIAS_PASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "${BUILD_ROOT}/sing-box/clients/android"
+          chmod +x ./gradlew
+          ./gradlew assembleOtherRelease
+
+      - name: Collect APK outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/apk-output"
+          cp -r "${BUILD_ROOT}/sing-box/clients/android/app/build/outputs/apk/other/release/." "${GITHUB_WORKSPACE}/apk-output/"
+          ls -lah "${GITHUB_WORKSPACE}/apk-output"
+
+      - name: Upload built APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: continuum-release-build
+          path: ${{ github.workspace }}/apk-output/*.apk
+          if-no-files-found: error
+
+  deploy-to-fdroid-repo:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download built APK
+        uses: actions/download-artifact@v4
+        with:
+          name: continuum-release-build
+          path: ./apk-output
+
+      - name: Push APK to F-Droid apk-upload branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch apk-uploads "https://${{ secrets.FDROIDS_REPO_TOKEN }}@github.com/user/fdroids.git" fdroid-repo
+          cd fdroid-repo/repo
+
+          cp ../../apk-output/*.apk .
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add *.apk
+          git diff --cached --quiet && exit 0
+          git commit -m "Upload new APK from sing-box build ${{ github.run_number }}"
+          git push origin apk-uploads
