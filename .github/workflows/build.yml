@@ -188,7 +188,7 @@ jobs:
       - name: Upload built APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: continuum-release-build
+          name: sing-box-release-build
           path: ${{ github.workspace }}/apk-output/*.apk
           if-no-files-found: error
 
@@ -200,14 +200,14 @@ jobs:
       - name: Download built APK
         uses: actions/download-artifact@v4
         with:
-          name: continuum-release-build
+          name: sing-box-release-build
           path: ./apk-output
 
       - name: Push APK to F-Droid apk-upload branch
         shell: bash
         run: |
           set -euo pipefail
-          git clone --branch apk-uploads "https://${{ secrets.FDROIDS_REPO_TOKEN }}@github.com/user/fdroids.git" fdroid-repo
+          git clone --branch apk-uploads "https://${{ secrets.FDROIDS_REPO_TOKEN }}@github.com/imjuzcy/fdroids.git" fdroid-repo
           cd fdroid-repo/repo
 
           cp ../../apk-output/*.apk .
